@@ -1,0 +1,24 @@
+{
+  "originHash" : "5f2f5db930c1fc074a68f3e3bf34137e22e91f3228a83ca949a199b640c30dc8",
+  "pins" : [
+    {
+      "identity" : "chat-sdk-ios",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/cometchat/chat-sdk-ios",
+      "state" : {
+        "revision" : "284bd742f4151ad9c9d5d0945389253a6715d6ba",
+        "version" : "4.0.55"
+      }
+    },
+    {
+      "identity" : "seald-sdk-ios",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/seald/seald-sdk-ios",
+      "state" : {
+        "revision" : "ead87705176883deced4963979cfcb81487b1c36",
+        "version" : "0.9.0"
+      }
+    }
+  ],
+  "version" : 3
+}
