@@ -9,9 +9,13 @@ import CometChatSDK
 
 extension CometChatException: @retroactive @unchecked Sendable {}
 extension CometChatException: @retroactive Error {}
+
 extension Error {
     var toCometChatException: CometChatException {
-        .init(errorCode: "", errorDescription: localizedDescription)
+        let nsError = self as NSError
+        let errorCode = nsError.userInfo["code"] as? String ?? "UNKNOWN"
+        let errorDescription = nsError.userInfo["details"] as? String ?? nsError.localizedDescription
+        return .init(errorCode: errorCode, errorDescription: errorDescription)
     }
 }
 

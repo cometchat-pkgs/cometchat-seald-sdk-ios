@@ -4,15 +4,13 @@
 @preconcurrency import SealdSdk
 import CryptoKit
 import UIKit
-import CometChatSDK
+@preconcurrency import CometChatSDK
 import Security
 
-public class CometChatSealdSDK {
-    private var seald: SealdSdk!
-    private var sealdAccountInfo: SealdAccountInfo!
+final public class CometChatSealdSDK: Sendable {
+    private let seald: SealdSdk!
     private let uid: String
-    private var sessions = [String: SealdEncryptionSession]()
-    private var activeRequests: [MessagesRequest] = []
+    
     
     public init?(uid: String, appId: String, apiUrl: String, encryptionSessionCacheTTL: TimeInterval = 0) throws {
         guard let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
@@ -26,7 +24,7 @@ public class CometChatSealdSDK {
                 apiUrl: apiUrl,
                 appId: appId,
                 databasePath: "\(documentsPath.relativePath)/sealdDB/\(uid)",
-                databaseEncryptionKey: generateDBEncryptionKey(from: uid),
+                databaseEncryptionKey: CometChatSealdSDK.generateDBEncryptionKey(from: uid),
                 instanceName: "\(uid)",
                 logLevel: 0,
                 logNoColor: true,
@@ -34,8 +32,8 @@ public class CometChatSealdSDK {
                 keySize: 4096
             )
             SealdSdk.initialize()
-            DispatchQueue.global().async {[weak self] in
-                self?.populateSessionsCache()
+            Task { [weak self] in
+                await self?.populateSessionsCache()
             }
             
         } catch {
@@ -43,23 +41,26 @@ public class CometChatSealdSDK {
         }
     }
     
-    private func populateSessionsCache() {
+    private func populateSessionsCache() async {
         guard let currUser = CometChat.getLoggedInUser(),
               let metaData = currUser.metadata,
               let sessionsId = metaData[SealdMetadataConstants.sessionsMetaadataKey] as? [String: String] else {
             return
         }
         
-        for (reciverUid, sessionId)in sessionsId {
+        for (receiverUid, sessionId)in sessionsId {
             if let session = try? seald.retrieveEncryptionSession(withSessionId: sessionId, useCache: true, lookupProxyKey: false, lookupGroupKey: false) {
-                sessions[reciverUid] = session
+                await CometChatSealdGlobalActor.shared.setSession(session, for: receiverUid)
+                
             }
         }
     }
-    private func generateDBEncryptionKey(from userID: String) -> Data {
+    
+    static private func generateDBEncryptionKey(from userID: String) -> Data {
         if let data = getKeyFromKeychain(for: userID) {
             return data
         }
+        
         let inputKey = SymmetricKey(data: userID.data(using: .utf8)!) // Convert user ID to key
         let salt = UUID().uuidString.data(using: .utf8)! // Salt ensures uniqueness across different contexts
         
@@ -75,7 +76,7 @@ public class CometChatSealdSDK {
         return data
     }
     
-    private func getKeyFromKeychain(for key: String) -> Data? {
+    static private func getKeyFromKeychain(for key: String) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: key,
@@ -92,7 +93,7 @@ public class CometChatSealdSDK {
         return nil
     }
     
-    private func saveKeyToKeychain(_ data: Data, for key: String) {
+    static private func saveKeyToKeychain(_ data: Data, for key: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: key,
@@ -137,7 +138,7 @@ public extension CometChatSealdSDK {
             return
         }
         do {
-            sealdAccountInfo = try await seald.createAccountAsync(
+            let sealdAccountInfo = try await seald.createAccountAsync(
                 withSignupJwt: withSignupJwt,
                 deviceName: UIDevice.current.identifierForVendor!.uuidString,
                 displayName: uid,
@@ -174,12 +175,15 @@ public extension CometChatSealdSDK {
 
 public extension CometChatSealdSDK {
     
-    private func getSessionFromCache(for receiver: User, completion: @escaping (Result<SealdEncryptionSession?, CometChatException>) -> Void) {
+    private func getSessionFromCache(for receiver: User, completion: @escaping @Sendable (Result<SealdEncryptionSession?, CometChatException>) -> Void) {
         guard let receiverUid = receiver.uid else {
             completion(.failure(.init(errorCode: "", errorDescription: "receiver uid not found")))
             return
         }
-        completion(.success(sessions[receiverUid]))
+        Task {
+            let session = await CometChatSealdGlobalActor.shared.sessions[receiverUid]
+            completion(.success(session))
+        }
     }
     
     private func getSessionFromCustomMsg(for receiver: User, completion: @escaping (Result<SealdEncryptionSession?, CometChatException>) -> Void) {
@@ -195,12 +199,17 @@ public extension CometChatSealdSDK {
             .build()
         
         // Store the request to keep it alive
-        self.activeRequests.append(reqBuilder)
+        Task {@Sendable () -> Void in
+            await CometChatSealdGlobalActor.shared.appendActiveRequest(reqBuilder)
+        }
         
         reqBuilder.fetchPrevious { [weak self] msgs in
             // Remove request after completion
-            self?.activeRequests.removeAll { $0 === reqBuilder }
-            
+            defer {
+                Task {@Sendable () -> Void in
+                    await CometChatSealdGlobalActor.shared.removeActiveRequest(reqBuilder)
+                }
+            }
             if let msg = msgs?.first as? CustomMessage,
                let customData = msg.customData,
                let encryptedTxt = customData[SealdMetadataConstants.customMetaDataKey] as? String {
@@ -216,8 +225,11 @@ public extension CometChatSealdSDK {
             }
         } onError: { [weak self] error in
             // Remove request after error
-            self?.activeRequests.removeAll { $0 === reqBuilder }
-            
+            defer {
+                Task {@Sendable () -> Void in
+                    await CometChatSealdGlobalActor.shared.removeActiveRequest(reqBuilder)
+                }
+            }
             if let error = error {
                 completion(.failure(error))
             } else {
@@ -283,11 +295,12 @@ public extension CometChatSealdSDK {
         })
     }
     
-    func fetchAndLoadEncryptionSession(for receiver: User, completion: @escaping (Result<SealdEncryptionSession, CometChatException>) -> Void) {
+    func fetchAndLoadEncryptionSession(for receiver: User, completion: @escaping @Sendable (Result<SealdEncryptionSession, CometChatException>) -> Void) {
         guard let receiverUid = receiver.uid else {
             completion(.failure(.init(errorCode: "", errorDescription: "receiver uid not found")))
             return
         }
+        let session = SealdEncryptionSession(encryptionSession: .init())
         
         getSessionFromCache(for: receiver) { [weak self] result in
             switch result {
@@ -299,8 +312,7 @@ public extension CometChatSealdSDK {
                         switch result {
                         case .success(let session):
                             if let session {
-                                self?.sessions[receiverUid] = session
-                                completion(.success(session))
+                                self?.cacheSession(for: receiverUid, session, completion: completion)
                             } else {
                                 self?.getSessionFromCustomMsg(for: receiver) {[weak self] result in
                                     switch result {
@@ -310,8 +322,7 @@ public extension CometChatSealdSDK {
                                                 switch result {
                                                     
                                                 case .success():
-                                                    self?.sessions[receiverUid] = session
-                                                    completion(.success(session))
+                                                    self?.cacheSession(for: receiverUid, session, completion: completion)
                                                 case .failure(let error):
                                                     completion(.failure(error))
                                                 }
@@ -327,8 +338,7 @@ public extension CometChatSealdSDK {
                                                                 switch result {
                                                                     
                                                                 case .success():
-                                                                    self?.sessions[receiverUid] = newSession
-                                                                    completion(.success(newSession))
+                                                                    self?.cacheSession(for: receiverUid, newSession, completion: completion)
                                                                 case .failure(let error):
                                                                     completion(.failure(error))
                                                                 }
@@ -357,6 +367,14 @@ public extension CometChatSealdSDK {
                 completion(.failure(error))
             }
         }
+    }
+    
+    private func cacheSession(for receiverUid: String, _ session: SealdEncryptionSession, completion: @escaping @Sendable (Result<SealdEncryptionSession, CometChatException>) -> Void) {
+        Task {
+            await CometChatSealdGlobalActor.shared.setSession(session, for: receiverUid)
+            completion(.success(session))
+        }
+        
     }
     
     func fetchAndLoadEncryptionSession(for receiver: User) async throws -> SealdEncryptionSession {
@@ -442,7 +460,7 @@ public extension CometChatSealdSDK {
         }
     }
     
-    func encryptMessage(_ message: String, for receiver: User, completion: @escaping (Result<String, CometChatException>) -> Void) {
+    func encryptMessage(_ message: String, for receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
         fetchAndLoadEncryptionSession(for: receiver) { result in
             switch result {
             case .success(let session):
@@ -463,7 +481,7 @@ public extension CometChatSealdSDK {
         return try await session.encryptMessageAsync(message)
     }
     
-    func decryptMessage(_ message: String, for receiver: User, completion: @escaping (Result<String, CometChatException>) -> Void) {
+    func decryptMessage(_ message: String, for receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
         fetchAndLoadEncryptionSession(for: receiver) { result in
             switch result {
             case .success(let session):
@@ -485,7 +503,7 @@ public extension CometChatSealdSDK {
         return try await session.decryptMessageAsync(message)
     }
     
-    func encryptFile(fromData: Data, filename: String, for receiver: User, completion: @escaping (Result<Data, CometChatException>) -> Void) {
+    func encryptFile(fromData: Data, filename: String, for receiver: User, completion: @escaping @Sendable (Result<Data, CometChatException>) -> Void) {
         fetchAndLoadEncryptionSession(for: receiver) { result in
             switch result {
             case .success(let session):
@@ -506,7 +524,7 @@ public extension CometChatSealdSDK {
         return try await session.encryptFileAsync(fromData, filename: filename)
     }
     
-    func decryptFile(fromData: Data, for receiver: User, completion: @escaping (Result<SealdClearFile, CometChatException>) -> Void) {
+    func decryptFile(fromData: Data, for receiver: User, completion: @escaping @Sendable (Result<SealdClearFile, CometChatException>) -> Void) {
         fetchAndLoadEncryptionSession(for: receiver) { result in
             switch result {
             case .success(let session):
@@ -528,7 +546,7 @@ public extension CometChatSealdSDK {
         return try await session.decryptFileAsync(fromData)
     }
     
-    func encryptFile(fromURI: String, for receiver: User, completion: @escaping (Result<String, CometChatException>) -> Void) {
+    func encryptFile(fromURI: String, for receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
         fetchAndLoadEncryptionSession(for: receiver) { result in
             switch result {
             case .success(let session):
@@ -549,7 +567,7 @@ public extension CometChatSealdSDK {
         return try await session.encryptFileAsync(fromURI: fromURI)
     }
     
-    func decryptFile(fromURI: String, for receiver: User, completion: @escaping (Result<String, CometChatException>) -> Void) {
+    func decryptFile(fromURI: String, for receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
         fetchAndLoadEncryptionSession(for: receiver) { result in
             switch result {
             case .success(let session):
@@ -571,26 +589,27 @@ public extension CometChatSealdSDK {
         return try await session.decryptFileAsync(fromURI: fromURI)
     }
     
-    func cleanup() {
-        self.seald = nil
-        self.sessions = [:]
-    }
-    
 }
 
 public extension CometChatSealdSDK {
-    func removeSessionForUser(for receiver: User, completion: @escaping (Result<Bool, CometChatException>) -> Void) {
+    func removeSessionForUser(for receiver: User, completion: @escaping @Sendable (Result<Bool, CometChatException>) -> Void) {
         guard let receiverUid = receiver.uid else {
             completion(.failure(.init(errorCode: "", errorDescription: "receiver uid not found")))
             return
         }
-        if let _ = sessions[receiverUid] {
-            completion(.success(true))
-        } else {
-            completion(.failure(.init(errorCode: "", errorDescription:  "session not found for \(receiverUid)")))
+        
+        Task {
+            if await CometChatSealdGlobalActor.shared.hasSession(for: receiverUid) {
+                completion(.success(true))
+            } else {
+                completion(.failure(.init(errorCode: "", errorDescription:  "session not found for \(receiverUid)")))
+            }
         }
     }
+    
     func clearEncryptionSessions() {
-        sessions.removeAll()
+        Task {
+            await CometChatSealdGlobalActor.shared.clearSessions()
+        }
     }
 }
