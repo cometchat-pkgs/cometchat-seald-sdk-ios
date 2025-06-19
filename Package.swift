@@ -6,16 +6,17 @@ import PackageDescription
 let package = Package(
     name: "CometChatSealdSDK",
     platforms: [
-        .iOS(.v14) // Specify iOS 13+ support
+            .iOS(.v14) // Specify iOS 13+ support
     ],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
             name: "CometChatSealdSDK",
+            type: .dynamic,
             targets: ["CometChatSealdSDK"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/seald/seald-sdk-ios", from: "0.9.0"),
+        .package(url: "https://github.com/seald/seald-sdk-ios", exact: "0.9.0"),
         .package(url: "https://github.com/cometchat/chat-sdk-ios", from: "4.0.55")
     ],
     targets: [
@@ -28,6 +29,9 @@ let package = Package(
                 .productItem(name: "CometChatSDK", package: "chat-sdk-ios", moduleAliases: nil, condition: nil)
             ]
         ),
-
+        .testTarget(
+            name: "CometChatSealdSDKTests",
+            dependencies: ["CometChatSealdSDK"]
+        ),
     ]
 )

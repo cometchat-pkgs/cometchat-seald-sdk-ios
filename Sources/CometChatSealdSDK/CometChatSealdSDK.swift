@@ -7,10 +7,9 @@ import UIKit
 @preconcurrency import CometChatSDK
 import Security
 
-final public class CometChatSealdSDK: Sendable {
+final public class CometChatSealdSDK: Sendable{
     private let seald: SealdSdk!
     private let uid: String
-    
     
     public init?(uid: String, appId: String, apiUrl: String, encryptionSessionCacheTTL: TimeInterval = 0) throws {
         guard let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
@@ -32,30 +31,29 @@ final public class CometChatSealdSDK: Sendable {
                 keySize: 4096
             )
             SealdSdk.initialize()
-            Task { [weak self] in
-                await self?.populateSessionsCache()
-            }
+//            Task { [weak self] in
+//                try? await Task.sleep(nanoseconds: 500_000_000)
+//                await self?.populateSessionsCache()
+//            }
             
-        } catch {
-            throw error  // If any error occurs, return nil instead of throwing
         }
     }
-    
-    private func populateSessionsCache() async {
-        guard let currUser = CometChat.getLoggedInUser(),
-              let metaData = currUser.metadata,
-              let sessionsId = metaData[SealdMetadataConstants.sessionsMetaadataKey] as? [String: String] else {
-            return
-        }
         
-        for (receiverUid, sessionId)in sessionsId {
-            if let session = try? seald.retrieveEncryptionSession(withSessionId: sessionId, useCache: true, lookupProxyKey: false, lookupGroupKey: false) {
-                await CometChatSealdGlobalActor.shared.setSession(session, for: receiverUid)
-                
-            }
-        }
-    }
-    
+//            private func populateSessionsCache() async {
+//                guard let currUser = CometChat.getLoggedInUser(),
+//                      let metaData = currUser.metadata,
+//                      let sessionsId = metaData[SealdMetadataConstants.sessionsMetaadataKey] as? [String: String] else {
+//                    return
+//                }
+//        
+//                for (receiverUid, sessionId)in sessionsId {
+//                    if let session = try? seald.retrieveEncryptionSession(withSessionId: sessionId, useCache: true, lookupProxyKey: false, lookupGroupKey: false) {
+//                        await CometChatSealdGlobalActor.shared.setSession(session, for: receiverUid)
+//        
+//                    }
+//                }
+//            }
+        
     static private func generateDBEncryptionKey(from userID: String) -> Data {
         if let data = getKeyFromKeychain(for: userID) {
             return data
@@ -171,11 +169,44 @@ public extension CometChatSealdSDK {
             }
         })
     }
+    
+    private func getUpdatedUserMetadata(metaData : [String: Any],user: User, sessionId: String, completion: @escaping (Result<Void, CometChatException>) -> Void) {
+        guard let uid = user.uid else {
+            completion(.failure(.init(errorCode: "", errorDescription: "receiver uid not found")))
+            return
+        }
+        if  user.metadata == nil {
+            user.metadata = [:]
+        }
+        var currentMetaData = metaData
+        var sessionsObject: [String: Any]
+        if let existingSessions = currentMetaData[SealdMetadataConstants.sessionsMetaadataKey] as? [String : Any] {
+            sessionsObject = existingSessions
+        } else {
+            sessionsObject = [:]
+        }
+        
+        sessionsObject[uid] = sessionId
+        
+        currentMetaData[SealdMetadataConstants.sessionsMetaadataKey] = sessionsObject
+        guard let loggedInUser = CometChat.loggedInUser else { return }
+        loggedInUser.metadata = currentMetaData
+        
+        CometChat.updateCurrentUserDetails(user: loggedInUser, onSuccess: { user in
+            completion(.success(()))
+        }, onError: { error in
+            if let error  {
+                completion(.failure(error))
+            } else {
+                completion(.failure(.nilException("failed to update metadata for \(uid)")))
+            }
+        })
+    }
 }
 
 public extension CometChatSealdSDK {
     
-    private func getSessionFromCache(for receiver: User, completion: @escaping @Sendable (Result<SealdEncryptionSession?, CometChatException>) -> Void) {
+    private func getSessionFromCache(for receiver: User, completion: @escaping @Sendable (Result<CompositeEncryptionSession?, CometChatException>) -> Void) {
         guard let receiverUid = receiver.uid else {
             completion(.failure(.init(errorCode: "", errorDescription: "receiver uid not found")))
             return
@@ -238,33 +269,6 @@ public extension CometChatSealdSDK {
         }
     }
     
-    private func getSessionFromReceiversMetaData(for receiver: User, completion: @escaping (Result<SealdEncryptionSession?, CometChatException>) -> Void) {
-        
-        guard let currUser = CometChat.getLoggedInUser() else {
-            completion(.failure(.init(errorCode: "", errorDescription: "current logged in user not found")))
-            return
-        }
-        guard let currUserUid = currUser.uid else {
-            completion(.failure(.init(errorCode: "", errorDescription: "current user uid not found")))
-            return
-        }
-        guard let metaData = receiver.metadata, let metaDataSessionsId = metaData[SealdMetadataConstants.sessionsMetaadataKey] as? [String: String] else {
-            completion(.success(nil))
-            return
-        }
-        
-        if let sessionId = metaDataSessionsId[currUserUid] {
-            do {
-                let session = try seald.retrieveEncryptionSession(withSessionId: sessionId, useCache: false, lookupProxyKey: false, lookupGroupKey: false)
-                completion(.success(session))
-            } catch {
-                completion(.failure(.init(errorCode: "", errorDescription: error.localizedDescription)))
-            }
-        } else {
-            completion(.success(nil))
-        }
-    }
-    
     private func updateMetaDataWithSessionId(_ sessionId: String, for receiver: User, completion: @escaping (Result<Void, CometChatException>) -> Void) {
         guard let receiverUid = receiver.uid else {
             completion(.failure(.init(errorCode: "", errorDescription: "receiver uid not found")))
@@ -295,94 +299,462 @@ public extension CometChatSealdSDK {
         })
     }
     
-    func fetchAndLoadEncryptionSession(for receiver: User, completion: @escaping @Sendable (Result<SealdEncryptionSession, CometChatException>) -> Void) {
-        guard let receiverUid = receiver.uid else {
-            completion(.failure(.init(errorCode: "", errorDescription: "receiver uid not found")))
+    //MARK: Previous Logic for EncryptionSessions
+    
+//    func fetchAndLoadEncryptionSession(for receiver: User, completion: @escaping @Sendable (Result<SealdEncryptionSession, CometChatException>) -> Void) {
+//        guard let receiverUid = receiver.uid else {
+//            completion(.failure(.init(errorCode: "", errorDescription: "receiver uid not found")))
+//            return
+//        }
+//        let session = SealdEncryptionSession(encryptionSession: .init())
+//        
+//        getSessionFromCache(for: receiver) { [weak self] result in
+//            switch result {
+//            case .success(let session):
+//                if let session {
+//                    completion(.success(session))
+//                } else {
+//                    self?.getSessionFromReceiversMetaData(for: receiver) { [weak self] result in
+//                        switch result {
+//                        case .success(let session):
+//                            if let session {
+//                                self?.cacheSession(for: receiverUid, session, completion: completion)
+//                            } else {
+//                                self?.getSessionFromCustomMsg(for: receiver) {[weak self] result in
+//                                    switch result {
+//                                    case .success(let session):
+//                                        if let session = session {
+//                                            self?.updateMetaDataWithSessionId(session.sessionId, for: receiver) { result in
+//                                                switch result {
+//                                                    
+//                                                case .success():
+//                                                    self?.cacheSession(for: receiverUid, session, completion: completion)
+//                                                case .failure(let error):
+//                                                    completion(.failure(error))
+//                                                }
+//                                            }
+//                                        } else {
+//                                            self?.createSession(for: receiver) { sessionResult in
+//                                                switch sessionResult {
+//                                                case .success(let newSession):
+//                                                    self?.sendCustomMessage(session: newSession, to: receiver) { msgResult in
+//                                                        switch msgResult {
+//                                                        case .success:
+//                                                            self?.updateMetaDataWithSessionId(newSession.sessionId, for: receiver) { result in
+//                                                                switch result {
+//                                                                    
+//                                                                case .success():
+//                                                                    self?.cacheSession(for: receiverUid, newSession, completion: completion)
+//                                                                case .failure(let error):
+//                                                                    completion(.failure(error))
+//                                                                }
+//                                                            }
+//                                                        case .failure(let error):
+//                                                            completion(.failure(error))
+//                                                        }
+//                                                    }
+//                                                case .failure(let error):
+//                                                    completion(.failure(error))
+//                                                }
+//                                            }
+//                                        }
+//                                    case .failure(let error):
+//                                        completion(.failure(error))
+//                                    }
+//                                }
+//                            }
+//                        case .failure(let error):
+//                            completion(.failure(error))
+//                        }
+//                    }
+//                    
+//                }
+//            case .failure(let error):
+//                completion(.failure(error))
+//            }
+//        }
+//    }
+    
+    //MARK: Changed Logic for EncryptionSessions
+
+    func fetchAndLoadEncryptionSession(for conversationWith: User, completion: @escaping @Sendable (Result<CompositeEncryptionSession, CometChatException>) -> Void) {
+        guard let loggedInUser = CometChat.getLoggedInUser() else {
+            completion(.failure(.init(errorCode: "ERROR_USER_NOT_LOGGED_IN", errorDescription: "User not logged in. Please login to use this method")))
             return
         }
-        let session = SealdEncryptionSession(encryptionSession: .init())
         
-        getSessionFromCache(for: receiver) { [weak self] result in
-            switch result {
-            case .success(let session):
-                if let session {
-                    completion(.success(session))
-                } else {
-                    self?.getSessionFromReceiversMetaData(for: receiver) { [weak self] result in
-                        switch result {
-                        case .success(let session):
-                            if let session {
-                                self?.cacheSession(for: receiverUid, session, completion: completion)
-                            } else {
-                                self?.getSessionFromCustomMsg(for: receiver) {[weak self] result in
-                                    switch result {
-                                    case .success(let session):
-                                        if let session = session {
-                                            self?.updateMetaDataWithSessionId(session.sessionId, for: receiver) { result in
-                                                switch result {
-                                                    
-                                                case .success():
-                                                    self?.cacheSession(for: receiverUid, session, completion: completion)
-                                                case .failure(let error):
-                                                    completion(.failure(error))
-                                                }
-                                            }
-                                        } else {
-                                            self?.createSession(for: receiver) { sessionResult in
-                                                switch sessionResult {
-                                                case .success(let newSession):
-                                                    self?.sendCustomMessage(session: newSession, to: receiver) { msgResult in
-                                                        switch msgResult {
-                                                        case .success:
-                                                            self?.updateMetaDataWithSessionId(newSession.sessionId, for: receiver) { result in
-                                                                switch result {
-                                                                    
-                                                                case .success():
-                                                                    self?.cacheSession(for: receiverUid, newSession, completion: completion)
-                                                                case .failure(let error):
-                                                                    completion(.failure(error))
-                                                                }
-                                                            }
-                                                        case .failure(let error):
-                                                            completion(.failure(error))
-                                                        }
-                                                    }
-                                                case .failure(let error):
-                                                    completion(.failure(error))
-                                                }
-                                            }
-                                        }
-                                    case .failure(let error):
-                                        completion(.failure(error))
-                                    }
-                                }
-                            }
-                        case .failure(let error):
-                            completion(.failure(error))
-                        }
-                    }
-                    
+        guard let conversationWithUid = conversationWith.uid else {
+            completion(.failure(.init(errorCode: "", errorDescription: "Conversation user UID is missing")))
+            return
+        }
+        
+        Task {
+            let cachedSession = await CometChatSealdGlobalActor.shared.getSession(for: conversationWithUid)
+            
+            await MainActor.run {
+                if let cachedSession = cachedSession {
+                    completion(.success(cachedSession))
+                    return
                 }
-            case .failure(let error):
-                completion(.failure(error))
+                
+                if let sessionId = self.fetchEncryptionSessionIdFromLoggedInUserMetadata(receiver: conversationWith) {
+                    let compositeEncryptionSession = CompositeEncryptionSession()
+                    do {
+                        let senderEncryptionSession = try self.seald.retrieveEncryptionSession(
+                            withSessionId: sessionId,
+                            useCache: false,
+                            lookupProxyKey: false,
+                            lookupGroupKey: false
+                        )
+                        compositeEncryptionSession.setSenderEncryptionSession(senderEncryptionSession: senderEncryptionSession)
+                        
+                        Task {
+                            await self.loadReceiverSessionFromMetadataOrFetch(conversationWith: conversationWith, compositeEncryptionSession: compositeEncryptionSession, completion: completion)
+                        }
+                    } catch {
+                        completion(.failure(.init(errorCode: "", errorDescription: "Error retrieving encryption session: \(error.localizedDescription)")))
+                    }
+                } else {
+                    self.createAndStoreNewEncryptionSession(loggedInUser: loggedInUser, conversationWith: conversationWith, completion: completion)
+                }
             }
         }
     }
+
+    private func loadReceiverSessionFromMetadataOrFetch(conversationWith: User, compositeEncryptionSession: CompositeEncryptionSession, completion: @escaping @Sendable (Result<CompositeEncryptionSession, CometChatException>) -> Void) async {
+        
+        guard let conversationWithUid = conversationWith.uid else {
+            await MainActor.run {
+                completion(.failure(.init(errorCode: "", errorDescription: "Conversation user UID is missing")))
+            }
+            return
+        }
+        
+        if let receiverSessionId = self.fetchEncryptionSessionIdFromReceiverMetadata(receiver: conversationWith) {
+            
+            do {
+                let receiverEncryptionSession = try self.seald.retrieveEncryptionSession(
+                    withSessionId: receiverSessionId,
+                    useCache: false,
+                    lookupProxyKey: false,
+                    lookupGroupKey: false
+                )
+                compositeEncryptionSession.setReceiverEncryptionSession(receiverEncryptionSession: receiverEncryptionSession)
+            } catch {
+                print("Error retrieving receiver session: \(error)")
+            }
+            
+            await CometChatSealdGlobalActor.shared.setSession(compositeEncryptionSession, for: conversationWithUid)
+            
+            await MainActor.run {
+                completion(.success(compositeEncryptionSession))
+            }
+            
+        } else {
+            await withCheckedContinuation { continuation in
+                CometChat.getUser(UID: conversationWithUid) { user in
+                    continuation.resume()
+                    
+                    Task {
+                        do {
+                            if let newReceiverSessionId = self.fetchEncryptionSessionIdFromReceiverMetadata(receiver: conversationWith) {
+                                let receiverEncryptionSession = try self.seald.retrieveEncryptionSession(
+                                    withSessionId: newReceiverSessionId,
+                                    useCache: false,
+                                    lookupProxyKey: false,
+                                    lookupGroupKey: false
+                                )
+                                compositeEncryptionSession.setReceiverEncryptionSession(receiverEncryptionSession: receiverEncryptionSession)
+                            }
+                            
+                            await CometChatSealdGlobalActor.shared.setSession(compositeEncryptionSession, for: conversationWithUid)
+                            
+                            await MainActor.run {
+                                completion(.success(compositeEncryptionSession))
+                            }
+                            
+                        } catch {
+                            await MainActor.run {
+                                completion(.failure(.init(errorCode: "", errorDescription: "Error retrieving encryption session: \(error.localizedDescription)")))
+                            }
+                        }
+                    }
+                } onError: { error in
+                    continuation.resume()
+                    Task {
+                        await MainActor.run {
+                            completion(.failure(.init(errorCode: "", errorDescription: "Error while getting user object")))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func createAndStoreNewEncryptionSession(loggedInUser: User, conversationWith: User, completion: @escaping @Sendable (Result<CompositeEncryptionSession, CometChatException>) -> Void) {
+        
+        guard let loggedInUserMetadata = loggedInUser.metadata,
+              loggedInUserMetadata[SealdMetadataConstants.sealdID] != nil else {
+            completion(.failure(.init(errorCode: "ERROR_SEALD_ID_NOT_FOUND", errorDescription: "SEALD_ID not found in logged in user metadata")))
+            return
+        }
+        
+        if let conversationWithMetadata = conversationWith.metadata,
+           conversationWithMetadata[SealdMetadataConstants.sealdID] != nil {
+        
+            createNewEncryptionSession(loggedInUser: loggedInUser, conversationWith: conversationWith, completion: completion)
+            
+        } else {
+            guard let conversationWithUid = conversationWith.uid else {
+                completion(.failure(.init(errorCode: "ERROR_SEALD_ID_NOT_FOUND", errorDescription: "SEALD_ID not found in receiver user metadata")))
+                return
+            }
+            
+            CometChat.getUser(UID: conversationWithUid) { user in
+                guard let user = user else {
+                    completion(.failure(.init(errorCode: "ERROR_USER_NOT_FOUND", errorDescription: "User not found")))
+                    return
+                }
+                
+                if let userMetadata = user.metadata,
+                   userMetadata[SealdMetadataConstants.sealdID] != nil {
+                    
+                    self.createNewEncryptionSession(loggedInUser: loggedInUser, conversationWith: user, completion: completion)
+                    
+                } else {
+                    completion(.failure(.init(errorCode: "ERROR_SEALD_ID_NOT_FOUND", errorDescription: "SEALD_ID not found in receiver user metadata")))
+                }
+                
+            } onError: { error in
+                if let error = error {
+                    completion(.failure(error))
+                } else {
+                    completion(.failure(.init(errorCode: "ERROR_UNKNOWN", errorDescription: "Unknown error occurred while fetching user")))
+                }
+            }
+        }
+    }
+
+    private func createNewEncryptionSession(loggedInUser: User, conversationWith: User, completion: @escaping @Sendable (Result<CompositeEncryptionSession, CometChatException>) -> Void) {
+        
+        do {
+            guard let loggedInUserSealdId = self.seald.getCurrentAccountInfo()?.userId,
+                  let conversationUserSealdId = self.getSealdId(for: conversationWith) else {
+                completion(.failure(.init(errorCode: "ERROR_SEALD_ID_NOT_FOUND", errorDescription: "SEALD_ID not found in user metadata")))
+                return
+            }
+            
+            let senderSession = try self.seald.createEncryptionSession(
+                withRecipients: [
+                    .init(recipientId: loggedInUserSealdId),
+                    .init(recipientId: conversationUserSealdId)
+                ],
+                metadata: nil as String?,
+                useCache: false
+            )
+            
+            let session = CompositeEncryptionSession()
+            session.setSenderEncryptionSession(senderEncryptionSession: senderSession)
+            
+            guard let loggedInUserMetadata = loggedInUser.metadata else {
+                completion(.failure(.init(errorCode: "ERROR_METADATA_MISSING", errorDescription: "Logged in user metadata is missing")))
+                return
+            }
+            
+            self.getUpdatedUserMetadata(metaData: loggedInUserMetadata, user: conversationWith, sessionId: senderSession.sessionId) { result in
+                switch result {
+                case .success(_):
+                    if let receiverSessionId = self.fetchEncryptionSessionIdFromReceiverMetadata(receiver: conversationWith) {
+                        
+                        do {
+                            let receiverSession = try self.seald.retrieveEncryptionSession(
+                                withSessionId: receiverSessionId,
+                                useCache: false,
+                                lookupProxyKey: false,
+                                lookupGroupKey: false
+                            )
+                            session.setReceiverEncryptionSession(receiverEncryptionSession: receiverSession)
+                        } catch {
+                            print("Error retrieving receiver session: \(error)")
+                        }
+                    }
+                    
+                    guard let conversationWithUid = conversationWith.uid else {
+                        completion(.failure(.init(errorCode: "ERROR_UID_MISSING", errorDescription: "Conversation user UID is missing")))
+                        return
+                    }
+                    
+                    Task {
+                        await CometChatSealdGlobalActor.shared.setSession(session, for: conversationWithUid)
+                        
+                        await MainActor.run {
+                            completion(.success(session))
+                        }
+                    }
+                    
+                case .failure(let failure):
+                    completion(.failure(failure))
+                }
+            }
+            
+        } catch {
+            completion(.failure(.init(errorCode: "ERROR_JSON_EXCEPTION", errorDescription: error.localizedDescription)))
+        }
+    }
+
+    private func fetchAndLoadEncryptionSessionInternal(conversationWith: User,isEncrypting: Bool,isSenderDecrypting: Bool,completion: @escaping @Sendable (Result<CompositeEncryptionSession, CometChatException>) -> Void
+    ) {
+        guard let loggedInUser = CometChat.getLoggedInUser() else {
+            completion(.failure(.init(errorCode: "ERROR_USER_NOT_LOGGED_IN", errorDescription: "User not logged in. Please login to use this method")))
+            return
+        }
+        
+        guard let uid = conversationWith.uid else {
+            completion(.failure(.init(errorCode: "ERROR_INVALID_UID", errorDescription: "Conversation user UID is missing")))
+            return
+        }
+        
+        Task {
+            let cachedSession = await CometChatSealdGlobalActor.shared.getSession(for: uid)
+            
+                if let cachedSession = cachedSession {
+                    
+                    var needsRefresh = false
+                    
+                    if isEncrypting {
+                        if cachedSession.getSenderEncryptionSession() == nil {
+                            print("Sender session missing for encryption, refreshing...")
+                            needsRefresh = true
+                        }
+                    } else {
+                        if isSenderDecrypting {
+                            if cachedSession.getSenderEncryptionSession() == nil {
+                                print("Sender session missing for decryption, refreshing...")
+                                needsRefresh = true
+                            }
+                        } else {
+                            if cachedSession.getReceiverEncryptionSession() == nil {
+                                print("Receiver session missing for decryption, refreshing...")
+                                needsRefresh = true
+                            }
+                        }
+                    }
+                    
+                    if needsRefresh {
+                        await CometChatSealdGlobalActor.shared.removeSession(for: uid)
+                        self.fetchAndLoadEncryptionSessionInternal(
+                            conversationWith: conversationWith,
+                            isEncrypting: isEncrypting,
+                            isSenderDecrypting: isSenderDecrypting,
+                            completion: completion
+                        )
+                        return
+                    }
+                    
+                    completion(.success(cachedSession))
+                    return
+                }
+            
+            self.continueMetadataCheck(loggedInUser: loggedInUser, conversationWith: conversationWith, completion: completion)
+        }
+        
+    }
+
+    private func continueMetadataCheck(loggedInUser: User,conversationWith: User,completion: @escaping @Sendable (Result<CompositeEncryptionSession, CometChatException>) -> Void
+    ) {
+        if let senderSessionId = self.fetchEncryptionSessionIdFromLoggedInUserMetadata(receiver: conversationWith) {
+            print("fetchAndLoadEncryptionSession Logged in user ES found in user metadata")
+            
+            let compositeEncryptionSession = CompositeEncryptionSession()
+            
+            do {
+                let senderSession = try self.seald.retrieveEncryptionSession(
+                    withSessionId: senderSessionId,
+                    useCache: false,
+                    lookupProxyKey: false,
+                    lookupGroupKey: false
+                )
+                compositeEncryptionSession.setSenderEncryptionSession(senderEncryptionSession: senderSession)
+                
+                Task {
+                    await self.loadReceiverSessionFromMetadataOrFetch(
+                        conversationWith: conversationWith,
+                        compositeEncryptionSession: compositeEncryptionSession,
+                        completion: completion
+                    )
+                }
+                
+            } catch {
+                completion(.failure(.init(errorCode: "ERROR_RETRIEVE_SESSION", errorDescription: "Error retrieving sender session: \(error.localizedDescription)")))
+            }
+            
+        } else {
+            createAndStoreNewEncryptionSession(loggedInUser: loggedInUser, conversationWith: conversationWith, completion: completion)
+        }
+    }
     
-    private func cacheSession(for receiverUid: String, _ session: SealdEncryptionSession, completion: @escaping @Sendable (Result<SealdEncryptionSession, CometChatException>) -> Void) {
+    private func fetchEncryptionSessionIdFromLoggedInUserMetadata(receiver: User) -> String? {
+        guard let loggedInUser = CometChat.getLoggedInUser(),
+              let currentMetadata = loggedInUser.metadata,
+              let sessionsObject = currentMetadata["SESSIONS"] as? [String: Any],
+              let receiverUid = receiver.uid else {
+            return nil
+        }
+        return sessionsObject[receiverUid] as? String
+    }
+    
+    private func fetchEncryptionSessionIdFromReceiverMetadata(receiver: User) -> String? {
+        guard let loggedInUser = CometChat.getLoggedInUser(),
+              let currentMetadata = receiver.metadata,
+              let sessionsObject = currentMetadata["SESSIONS"] as? [String: Any],
+              let loggedInUserUid = loggedInUser.uid else {
+            return nil
+        }
+        return sessionsObject[loggedInUserUid] as? String
+    }
+    
+    private func getSessionFromReceiversMetaData(for receiver: User, completion: @escaping (Result<SealdEncryptionSession?, CometChatException>) -> Void) {
+        
+        guard let currUser = CometChat.getLoggedInUser() else {
+            completion(.failure(.init(errorCode: "", errorDescription: "current logged in user not found")))
+            return
+        }
+        guard let currUserUid = currUser.uid else {
+            completion(.failure(.init(errorCode: "", errorDescription: "current user uid not found")))
+            return
+        }
+        guard let metaData = receiver.metadata, let metaDataSessionsId = metaData[SealdMetadataConstants.sessionsMetaadataKey] as? [String: String] else {
+            completion(.success(nil))
+            return
+        }
+        if let sessionId = metaDataSessionsId[currUserUid] {
+            do {
+                let session = try seald.retrieveEncryptionSession(withSessionId: sessionId, useCache: false, lookupProxyKey: false, lookupGroupKey: false)
+                completion(.success(session))
+            } catch {
+                completion(.failure(.init(errorCode: "", errorDescription: error.localizedDescription)))
+            }
+        } else {
+            completion(.success(nil))
+            
+        }
+    
+        
+    }
+    
+    private func cacheSession(for receiverUid: String, _ session: CompositeEncryptionSession, completion: @escaping @Sendable (Result<CompositeEncryptionSession, CometChatException>) -> Void) {
         Task {
             await CometChatSealdGlobalActor.shared.setSession(session, for: receiverUid)
             completion(.success(session))
         }
-        
     }
     
-    func fetchAndLoadEncryptionSession(for receiver: User) async throws -> SealdEncryptionSession {
+    func fetchAndLoadEncryptionSession(for receiver: User) async throws -> CompositeEncryptionSession {
         return try await withCheckedThrowingContinuation { continuation in
             fetchAndLoadEncryptionSession(for: receiver) { result in
                 switch result {
-                case .success(let session):
-                    continuation.resume(returning: session)
+                case .success(let compositeEncryptionSession):
+                    continuation.resume(returning: compositeEncryptionSession)
                 case .failure(let error):
                     continuation.resume(throwing: error)
                 }
@@ -408,7 +780,7 @@ public extension CometChatSealdSDK {
                     .init(recipientId: sealdRecipientID),
                     .init(recipientId: sealdSenderID)
                 ],
-                metadata: nil,
+                metadata: nil as String?,
                 useCache: false
             )
             completion(.success(session))
@@ -422,6 +794,17 @@ public extension CometChatSealdSDK {
             return nil
         }
         return sealdID as? String
+    }
+    
+    private func getConversationWithFromSenderAndReceiver(_ sender: User,_ receiver: User) -> User? {
+        if let loggedInUser = CometChat.getLoggedInUser(){
+            if (sender.uid == loggedInUser.uid) {
+                return receiver;
+            } else {
+                return sender;
+            }
+        }
+        return nil
     }
     
     private func sendCustomMessage(session: SealdEncryptionSession, to receiver: User, completion: @escaping (Result<Void, CometChatException>) -> Void) {
@@ -460,13 +843,19 @@ public extension CometChatSealdSDK {
         }
     }
     
-    func encryptMessage(_ message: String, for receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
-        fetchAndLoadEncryptionSession(for: receiver) { result in
+    func encryptMessage(_ message: String, receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
+        fetchAndLoadEncryptionSessionInternal(conversationWith: receiver,isEncrypting: true,isSenderDecrypting: false) { result in
             switch result {
             case .success(let session):
                 do {
-                    let encryptedMsg = try session.encryptMessage(message)
-                    completion(.success(encryptedMsg))
+                    if session.getSenderEncryptionSession() != nil {
+                        if let senderSession = session.getSenderEncryptionSession() {
+                            let encryptedMsg = try senderSession.encryptMessage(message)
+                            DispatchQueue.main.async {
+                                completion(.success(encryptedMsg))
+                            }
+                        }
+                    }
                 } catch {
                     completion(.failure(error.toCometChatException))
                 }
@@ -476,18 +865,59 @@ public extension CometChatSealdSDK {
         }
     }
     
-    func encryptMessageAsync(_ message: String, for receiver: User) async throws -> String {
-        let session = try await fetchAndLoadEncryptionSession(for: receiver)
-        return try await session.encryptMessageAsync(message)
+    func encryptMessageAsync(_ message: String,for receiver: User) async throws -> String {
+         return try await withCheckedThrowingContinuation { continuation in
+             fetchAndLoadEncryptionSessionInternal(
+                 conversationWith: receiver,
+                 isEncrypting: true,
+                 isSenderDecrypting: false
+             ) { result in
+                 switch result {
+                 case .success(let session):
+                     do {
+                         guard let senderSession = session.getSenderEncryptionSession() else {
+                             continuation.resume(throwing: CometChatException(errorCode: "NO_SENDER_SESSION", errorDescription: "Sender session not found"))
+                             return
+                         }
+                         Task{
+                             let encryptedMessage = try await senderSession.encryptMessageAsync(message)
+                             continuation.resume(returning: encryptedMessage)
+                         }
+                         
+                     } catch {
+                         continuation.resume(throwing: error)
+                     }
+                     
+                 case .failure(let error):
+                     continuation.resume(throwing: error)
+                 }
+             }
+         }
     }
     
-    func decryptMessage(_ message: String, for receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
-        fetchAndLoadEncryptionSession(for: receiver) { result in
+    func decryptMessage(_ message: String,sender: User, receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
+        guard let conversationWith = getConversationWithFromSenderAndReceiver(sender, receiver) else { return }
+        let isSenderDecrypting = CometChat.loggedInUser?.uid == sender.uid
+        fetchAndLoadEncryptionSessionInternal(conversationWith: conversationWith,isEncrypting: false,isSenderDecrypting: isSenderDecrypting) { result in
             switch result {
             case .success(let session):
                 do {
-                    let decryptedMsg = try session.decryptMessage(message)
-                    completion(.success(decryptedMsg))
+                    if sender.uid == CometChat.getLoggedInUser()?.uid {
+                        if let session = session.getSenderEncryptionSession() {
+                            let decryptedMsg = try session.decryptMessage(message)
+                            DispatchQueue.main.async {
+                                completion(.success(decryptedMsg))
+                            }
+                            
+                        }
+                    }else{
+                        if let session = session.getReceiverEncryptionSession() {
+                            let decryptedMsg = try session.decryptMessage(message)
+                            DispatchQueue.main.async {
+                                completion(.success(decryptedMsg))
+                            }
+                        }
+                    }
                 } catch {
                     completion(.failure(error.toCometChatException))
                 }
@@ -497,19 +927,62 @@ public extension CometChatSealdSDK {
             }
         }
     }
-    
-    func decryptMessageAsync(_ message: String, for receiver: User) async throws -> String {
-        let session = try await fetchAndLoadEncryptionSession(for: receiver)
-        return try await session.decryptMessageAsync(message)
+
+    func decryptMessageAsync(_ message: String,sender: User, receiver: User) async throws -> String {
+        guard let conversationWith = getConversationWithFromSenderAndReceiver(sender, receiver) else {
+            throw CometChatException(errorCode: "ERROR_CONVERSATION_USER", errorDescription: "Unable to determine conversation user")
+        }
+        
+        let isSenderDecrypting = CometChat.loggedInUser?.uid == sender.uid
+        return try await withCheckedThrowingContinuation { continuation in
+            fetchAndLoadEncryptionSessionInternal(
+                conversationWith: conversationWith,
+                isEncrypting: false,
+                isSenderDecrypting: isSenderDecrypting
+            ) { result in
+                switch result {
+                case .success(let session):
+                    do {
+                        if isSenderDecrypting {
+                            guard let senderSession = session.getSenderEncryptionSession() else {
+                                continuation.resume(throwing: CometChatException(errorCode: "NO_SENDER_SESSION", errorDescription: "Sender session not found"))
+                                return
+                            }
+                            Task{
+                                let decryptedMessage = try await senderSession.decryptMessageAsync(message)
+                                continuation.resume(returning: decryptedMessage)
+                            }
+                        }else{
+                            guard let receiverSession = session.getReceiverEncryptionSession() else {
+                                continuation.resume(throwing: CometChatException(errorCode: "NO_SENDER_SESSION", errorDescription: "Sender session not found"))
+                                return
+                            }
+                            Task{
+                                let decryptedMessage = try await receiverSession.decryptMessageAsync(message)
+                                continuation.resume(returning: decryptedMessage)
+                            }
+                        }
+                        
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                    
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
     
     func encryptFile(fromData: Data, filename: String, for receiver: User, completion: @escaping @Sendable (Result<Data, CometChatException>) -> Void) {
-        fetchAndLoadEncryptionSession(for: receiver) { result in
+        fetchAndLoadEncryptionSessionInternal(conversationWith: receiver,isEncrypting: true,isSenderDecrypting: false) { result in
             switch result {
             case .success(let session):
                 do {
-                    let encryptedData = try session.encryptFile(fromData, filename: filename)
-                    completion(.success(encryptedData))
+                    if let session = session.getSenderEncryptionSession() {
+                        let encryptedData = try session.encryptFile(fromData, filename: filename)
+                        completion(.success(encryptedData))
+                    }
                 } catch {
                     completion(.failure(error.toCometChatException))
                 }
@@ -520,17 +993,54 @@ public extension CometChatSealdSDK {
     }
     
     func encryptFileAsync(fromData: Data, filename: String, for receiver: User) async throws -> Data {
-        let session = try await fetchAndLoadEncryptionSession(for: receiver)
-        return try await session.encryptFileAsync(fromData, filename: filename)
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            fetchAndLoadEncryptionSessionInternal(
+                conversationWith: receiver,
+                isEncrypting: true,
+                isSenderDecrypting: false
+            ) { result in
+                switch result {
+                case .success(let session):
+                    do {
+                        guard let senderSession = session.getSenderEncryptionSession() else {
+                            continuation.resume(throwing: CometChatException(errorCode: "NO_SENDER_SESSION", errorDescription: "Sender session not found"))
+                            return
+                        }
+                        Task{
+                            let encryptedfile = try await senderSession.encryptFileAsync(fromData, filename: filename)
+                            continuation.resume(returning: encryptedfile)
+                        }
+                        
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                    
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
     
-    func decryptFile(fromData: Data, for receiver: User, completion: @escaping @Sendable (Result<SealdClearFile, CometChatException>) -> Void) {
-        fetchAndLoadEncryptionSession(for: receiver) { result in
+    func decryptFile(fromData: Data,sender: User,receiver: User, completion: @escaping @Sendable (Result<SealdClearFile, CometChatException>) -> Void) {
+        guard let conversationWith = getConversationWithFromSenderAndReceiver(sender, receiver) else { return }
+        let isSenderDecrypting = CometChat.loggedInUser?.uid == sender.uid
+        fetchAndLoadEncryptionSessionInternal(conversationWith: conversationWith, isEncrypting: false, isSenderDecrypting: isSenderDecrypting) { result in
             switch result {
             case .success(let session):
                 do {
-                    let decryptedClearFile = try session.decryptFile(fromData)
-                    completion(.success(decryptedClearFile))
+                    if isSenderDecrypting {
+                        if let session = session.getSenderEncryptionSession(){
+                            let decryptedClearFile = try session.decryptFile(fromData)
+                            completion(.success(decryptedClearFile))
+                        }
+                    }else{
+                        if let session = session.getReceiverEncryptionSession(){
+                            let decryptedClearFile = try session.decryptFile(fromData)
+                            completion(.success(decryptedClearFile))
+                        }
+                    }
                 } catch {
                     completion(.failure(error.toCometChatException))
                 }
@@ -541,18 +1051,71 @@ public extension CometChatSealdSDK {
         }
     }
     
-    func decryptFileAsync(fromData: Data, for receiver: User) async throws -> SealdClearFile {
-        let session = try await fetchAndLoadEncryptionSession(for: receiver)
-        return try await session.decryptFileAsync(fromData)
+    func decryptFileAsync(fromData: Data, sender: User, receiver: User) async throws -> SealdClearFile {
+        guard let conversationWith = getConversationWithFromSenderAndReceiver(sender, receiver) else {
+            throw CometChatException(errorCode: "ERROR_CONVERSATION_USER", errorDescription: "Unable to determine conversation user")
+        }
+        
+        let isSenderDecrypting = CometChat.loggedInUser?.uid == sender.uid
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            
+            fetchAndLoadEncryptionSessionInternal(
+                conversationWith: conversationWith,
+                isEncrypting: false,
+                isSenderDecrypting: isSenderDecrypting
+            ) { result in
+                switch result {
+                case .success(let session):
+                    if isSenderDecrypting {
+                        guard let senderSession = session.getSenderEncryptionSession() else {
+                            continuation.resume(throwing: CometChatException(errorCode: "NO_RECEIVER_SESSION", errorDescription: "Receiver session not found"))
+                            return
+                        }
+                        
+                        Task{
+                            do {
+                                let decryptedFile = try await senderSession.decryptFileAsync(fromData)
+                                continuation.resume(returning: decryptedFile)
+                            } catch {
+                                continuation.resume(throwing: error)
+                            }
+                        }
+                        
+                        
+                    } else {
+                        guard let receiverSession = session.getReceiverEncryptionSession() else {
+                            continuation.resume(throwing: CometChatException(errorCode: "NO_RECEIVER_SESSION", errorDescription: "Receiver session not found"))
+                            return
+                        }
+                        
+                        Task{
+                            do {
+                                let decryptedFile = try await receiverSession.decryptFileAsync(fromData)
+                                continuation.resume(returning: decryptedFile)
+                            } catch {
+                                continuation.resume(throwing: error)
+                            }
+                        }
+                        
+                    }
+                    
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
-    
+
     func encryptFile(fromURI: String, for receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
-        fetchAndLoadEncryptionSession(for: receiver) { result in
+        fetchAndLoadEncryptionSessionInternal(conversationWith: receiver, isEncrypting: true, isSenderDecrypting: false) { result in
             switch result {
             case .success(let session):
                 do {
-                    let encryptedFilePath = try session.encryptFile(fromURI: fromURI)
-                    completion(.success(encryptedFilePath))
+                    if let session = session.getSenderEncryptionSession(){
+                        let encryptedFilePath = try session.encryptFile(fromURI: fromURI)
+                        completion(.success(encryptedFilePath))
+                    }
                 } catch {
                     completion(.failure(error.toCometChatException))
                 }
@@ -563,17 +1126,52 @@ public extension CometChatSealdSDK {
     }
     
     func encryptFileAsync(fromURI: String, for receiver: User) async throws -> String {
-        let session = try await fetchAndLoadEncryptionSession(for: receiver)
-        return try await session.encryptFileAsync(fromURI: fromURI)
+        return try await withCheckedThrowingContinuation { continuation in
+            fetchAndLoadEncryptionSessionInternal(
+                conversationWith: receiver,
+                isEncrypting: true,
+                isSenderDecrypting: false
+            ) { result in
+                switch result {
+                case .success(let session):
+                    do {
+                        guard let senderSession = session.getSenderEncryptionSession() else {
+                            continuation.resume(throwing: CometChatException(errorCode: "NO_SENDER_SESSION", errorDescription: "Sender session not found"))
+                            return
+                        }
+                        Task{
+                            let encryptedfile = try await senderSession.encryptFileAsync(fromURI: fromURI)
+                            continuation.resume(returning: encryptedfile)
+                        }
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                    
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
     
-    func decryptFile(fromURI: String, for receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
-        fetchAndLoadEncryptionSession(for: receiver) { result in
+    func decryptFile(fromURI: String,sender: User, receiver: User, completion: @escaping @Sendable (Result<String, CometChatException>) -> Void) {
+        guard let conversationWith = getConversationWithFromSenderAndReceiver(sender, receiver) else { return }
+        let isSenderDecrypting = CometChat.loggedInUser?.uid == sender.uid
+        fetchAndLoadEncryptionSessionInternal(conversationWith: conversationWith, isEncrypting: false, isSenderDecrypting: isSenderDecrypting) { result in
             switch result {
             case .success(let session):
                 do {
-                    let decryptedFile = try session.decryptFile(fromURI: fromURI)
-                    completion(.success(decryptedFile))
+                    if isSenderDecrypting{
+                        if let session = session.getSenderEncryptionSession(){
+                            let decryptedFile = try session.decryptFile(fromURI: fromURI)
+                            completion(.success(decryptedFile))
+                        }
+                    }else{
+                        if let session = session.getReceiverEncryptionSession(){
+                            let decryptedFile = try session.decryptFile(fromURI: fromURI)
+                            completion(.success(decryptedFile))
+                        }
+                    }
                 } catch {
                     completion(.failure(error.toCometChatException))
                 }
@@ -584,11 +1182,54 @@ public extension CometChatSealdSDK {
         }
     }
     
-    func decryptFileAsync(fromURI: String, for receiver: User) async throws -> String {
-        let session = try await fetchAndLoadEncryptionSession(for: receiver)
-        return try await session.decryptFileAsync(fromURI: fromURI)
+    func decryptFileAsync(fromURI: String,sender: User, receiver: User) async throws -> String {
+        guard let conversationWith = getConversationWithFromSenderAndReceiver(sender, receiver) else {
+            throw CometChatException(errorCode: "ERROR_CONVERSATION_USER", errorDescription: "Unable to determine conversation user")
+        }
+        
+        let isSenderDecrypting = CometChat.loggedInUser?.uid == sender.uid
+        return try await withCheckedThrowingContinuation { continuation in
+            fetchAndLoadEncryptionSessionInternal(
+                conversationWith: conversationWith,
+                isEncrypting: false,
+                isSenderDecrypting: isSenderDecrypting
+            ) { result in
+                switch result {
+                case .success(let session):
+                    
+                    if isSenderDecrypting {
+                        guard let senderSession = session.getSenderEncryptionSession() else {
+                            continuation.resume(throwing: CometChatException(errorCode: "NO_SENDER_SESSION", errorDescription: "Sender session not found"))
+                            return
+                        }
+                        Task{
+                            do{
+                                let decryptedFile = try await senderSession.decryptFileAsync(fromURI: fromURI)
+                                continuation.resume(returning: decryptedFile)
+                            }catch{
+                                continuation.resume(throwing: error)
+                            }
+                        }
+                    }else{
+                        guard let receiverSession = session.getReceiverEncryptionSession() else {
+                            continuation.resume(throwing: CometChatException(errorCode: "NO_SENDER_SESSION", errorDescription: "Sender session not found"))
+                            return
+                        }
+                        Task{
+                            do{
+                                let decryptedFile = try await receiverSession.decryptFileAsync(fromURI: fromURI)
+                                continuation.resume(returning: decryptedFile)
+                            }catch{
+                                continuation.resume(throwing: error)
+                            }
+                        }
+                    }
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
-    
 }
 
 public extension CometChatSealdSDK {
@@ -613,3 +1254,4 @@ public extension CometChatSealdSDK {
         }
     }
 }
+

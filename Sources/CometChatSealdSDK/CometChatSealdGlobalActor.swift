@@ -12,12 +12,16 @@ import CometChatSDK
     public static let shared = CometChatSealdActor()
 }
 
-actor CometChatSealdActor {
-    var sessions = [String: SealdEncryptionSession]()
+actor CometChatSealdActor{
+    var sessions = [String: CompositeEncryptionSession]()
     var activeRequests: [MessagesRequest] = []
     
-    func setSession(_ session: SealdEncryptionSession, for uid: String) {
+    func setSession(_ session: CompositeEncryptionSession, for uid: String) {
         sessions[uid] = session
+    }
+    
+    func getSession(for uid: String) -> CompositeEncryptionSession? {
+        return sessions[uid]
     }
     
     func removeSession(for uid: String) {
